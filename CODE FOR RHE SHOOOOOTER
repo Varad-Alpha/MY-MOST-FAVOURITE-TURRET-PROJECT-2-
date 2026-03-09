@@ -1,0 +1,152 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include "fd_forward.h"
+
+#define WIFI_SSID "YOUR_WIFI"
+#define WIFI_PASS "YOUR_PASS"
+
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
+
+#define PAN_SERVO 0
+#define TILT_SERVO 1
+#define ESC_LEFT 2
+#define ESC_RIGHT 3
+#define PUSHER_SERVO 4
+
+#define ESC_ARM 300
+#define ESC_FIRE 460
+#define PUSHER_REST 60
+#define PUSHER_FIRE 115
+
+#define SPINUP_TIME 700
+#define FIRE_TIME 120
+#define FIRE_COOLDOWN 1500
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+static mtmn_config_t mtmn_config = mtmn_init_config();
+
+int panAngle = 90;
+int tiltAngle = 90;
+unsigned long lastFire = 0;
+bool armed = false;
+
+void setPulse(uint8_t ch, int pulse) {
+  pwm.setPWM(ch, 0, pulse);
+}
+
+void setAngle(uint8_t ch, int angle) {
+  int pulse = map(angle, 0, 180, 150, 600);
+  pwm.setPWM(ch, 0, pulse);
+}
+
+void armSystem() {
+  setPulse(ESC_LEFT, ESC_ARM);
+  setPulse(ESC_RIGHT, ESC_ARM);
+  setAngle(PUSHER_SERVO, PUSHER_REST);
+  armed = true;
+}
+
+void fireOnce() {
+  if (!armed) return;
+  setPulse(ESC_LEFT, ESC_FIRE);
+  setPulse(ESC_RIGHT, ESC_FIRE);
+  delay(SPINUP_TIME);
+  setAngle(PUSHER_SERVO, PUSHER_FIRE);
+  delay(FIRE_TIME);
+  setAngle(PUSHER_SERVO, PUSHER_REST);
+}
+
+void setup() {
+  Serial.begin(115200);
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.fb_count = 1;
+
+  esp_camera_init(&config);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) delay(300);
+
+  pwm.begin();
+  pwm.setPWMFreq(50);
+
+  setAngle(PAN_SERVO, panAngle);
+  setAngle(TILT_SERVO, tiltAngle);
+
+  delay(3000);
+  armSystem();
+}
+
+void loop() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return;
+
+  dl_matrix3du_t *img = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
+  fmt2rgb888(fb->buf, fb->len, fb->format, img->item);
+
+  box_array_t *faces = face_detect(img, &mtmn_config);
+
+  if (faces && faces->len > 0) {
+    int x = (faces->box[0].box_p[0] + faces->box[0].box_p[2]) / 2;
+    int y = (faces->box[0].box_p[1] + faces->box[0].box_p[3]) / 2;
+
+    int errX = x - 160;
+    int errY = y - 120;
+
+    panAngle -= errX * 0.05;
+    tiltAngle += errY * 0.05;
+
+    panAngle = constrain(panAngle, 30, 150);
+    tiltAngle = constrain(tiltAngle, 40, 140);
+
+    setAngle(PAN_SERVO, panAngle);
+    setAngle(TILT_SERVO, tiltAngle);
+
+    if (millis() - lastFire > FIRE_COOLDOWN) {
+      fireOnce();
+      lastFire = millis();
+    }
+  }
+
+  if (faces) free(faces);
+  dl_matrix3du_free(img);
+  esp_camera_fb_return(fb);
+  delay(15);
+}
